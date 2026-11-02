@@ -40,12 +40,14 @@ func main() {
 		http.HandleFunc("/upload", uploadHandler)
 		http.HandleFunc("/files", filesHandler)
 		http.HandleFunc("/zip", zipHandler)
+		http.HandleFunc("/icon/", iconHandler)
 	} else {
 		http.HandleFunc(secretPath, indexHandler)
 		http.HandleFunc(secretPath+"/", indexHandler)
 		http.HandleFunc(secretPath+"/upload", uploadHandler)
 		http.HandleFunc(secretPath+"/files", filesHandler)
 		http.HandleFunc(secretPath+"/zip", zipHandler)
+		http.HandleFunc(secretPath+"/icon/", iconHandler)
 		// 根路径及其它未匹配路径统一返回 404，隐藏上传入口
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
@@ -365,20 +367,63 @@ func createUniqueFile(dir, name string) (*os.File, string, error) {
 	}
 }
 
+// 文件列表与内嵌图标共用口令校验
+func requireListAuth(w http.ResponseWriter, r *http.Request) bool {
+	if listPassword == "" {
+		http.Error(w, "文件列表未启用：请设置 FILEHUB_PASSWORD 环境变量", http.StatusNotFound)
+		return false
+	}
+	_, pass, ok := r.BasicAuth()
+	if !ok || subtle.ConstantTimeCompare([]byte(pass), []byte(listPassword)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Basic realm="FileHub", charset="UTF-8"`)
+		http.Error(w, "需要口令", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+// 文件列表与图标接口的路径前缀，隐藏模式下随上传入口一起移动
+func iconPrefix() string {
+	return secretPath + "/icon/"
+}
+
+// 内嵌图标：exe/dll 等 PE 文件从资源中提取，.ico 直接返回
+func iconHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !requireListAuth(w, r) {
+		return
+	}
+	name := strings.TrimPrefix(r.URL.Path, iconPrefix())
+	path, ok := storedFilePath(name)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	data, ok := loadEmbeddedIcon(path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/x-icon")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	if r.Method == http.MethodHead {
+		return
+	}
+	w.Write(data)
+}
+
 // 文件列表：需设置 FILEHUB_PASSWORD，通过 HTTP Basic Auth 校验口令
 func filesHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if listPassword == "" {
-		http.Error(w, "文件列表未启用：请设置 FILEHUB_PASSWORD 环境变量", http.StatusNotFound)
-		return
-	}
-	_, pass, ok := r.BasicAuth()
-	if !ok || subtle.ConstantTimeCompare([]byte(pass), []byte(listPassword)) != 1 {
-		w.Header().Set("WWW-Authenticate", `Basic realm="FileHub", charset="UTF-8"`)
-		http.Error(w, "需要口令", http.StatusUnauthorized)
+	if !requireListAuth(w, r) {
 		return
 	}
 
@@ -434,6 +479,7 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
   .check{width:2.2em;text-align:center}
   .check input{width:1.05em;height:1.05em;cursor:pointer;accent-color:#4a90e2}
   .icon{display:inline-block;width:1.6em;text-align:center}
+  .icon img{width:1.25em;height:1.25em;object-fit:contain;vertical-align:-.2em}
   .bulk{display:flex;align-items:center;gap:.8em;margin-top:1.2em;flex-wrap:wrap}
   .bulk button{background:#4a90e2;color:#fff;border:none;border-radius:8px;padding:.65em 1.3em;cursor:pointer;font-size:.95em}
   .bulk button:hover{background:#357abd}
@@ -456,8 +502,13 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 		for _, f := range files {
 			name := html.EscapeString(f.name)
 			href := html.EscapeString("/f/" + url.PathEscape(f.name))
-			fmt.Fprintf(&b, `<tr><td class="check"><input type="checkbox" class="file-check" name="files" value="%s" aria-label="选择 %s"></td><td><span class="icon">%s</span><a href="%s">%s</a></td><td class="size">%s</td><td>%s</td><td class="ops"><button type="button" data-copy="%s">复制</button><button type="button" data-share="%s">分享</button></td></tr>`,
-				name, name, fileIcon(f.name), href, name, formatSize(f.size), f.modTime.Format("2006-01-02 15:04:05"), href, href)
+			iconHTML := `<span class="icon">` + fileIcon(f.name) + `</span>`
+			if hasEmbeddedIcon(f.name) {
+				src := html.EscapeString(iconPrefix() + url.PathEscape(f.name))
+				iconHTML = fmt.Sprintf(`<span class="icon"><img src="%s" alt="" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='inline'"><span style="display:none">%s</span></span>`, src, fileIcon(f.name))
+			}
+			fmt.Fprintf(&b, `<tr><td class="check"><input type="checkbox" class="file-check" name="files" value="%s" aria-label="选择 %s"></td><td>%s<a href="%s">%s</a></td><td class="size">%s</td><td>%s</td><td class="ops"><button type="button" data-copy="%s">复制</button><button type="button" data-share="%s">分享</button></td></tr>`,
+				name, name, iconHTML, href, name, formatSize(f.size), f.modTime.Format("2006-01-02 15:04:05"), href, href)
 		}
 		b.WriteString(`</tbody></table>
 <div class="bulk">

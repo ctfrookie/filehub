@@ -6,7 +6,7 @@
 
 - 🖱️ 拖拽或点击上传，带实时进度、上传速度和用时显示
 - 🔗 保留原始文件名，同名文件自动追加时间戳
-- 🖼️ 文件列表按文件类型显示图标
+- 🖼️ 文件列表按文件类型显示图标；`.exe`、`.dll` 等 Windows 程序会优先显示文件内嵌的真实图标
 - ☑️ 支持多选文件，一键打包为 ZIP 下载
 - 🔒 可选口令保护的文件列表页，集中查看并下载所有文件
 - 🙈 可选隐藏上传入口路径，根路径直接返回 404
@@ -196,7 +196,7 @@ docker pull ghcr.io/ctfrookie/filehub:latest
 2. 浏览器会弹出登录框：
    - 用户名：任意填写（例如 `admin`）
    - 密码：`FILEHUB_PASSWORD` 的值
-3. 验证通过后会按上传时间倒序列出所有文件，文件名前会显示对应类型的图标，并显示大小和上传时间
+3. 验证通过后会按上传时间倒序列出所有文件，文件名前会显示对应类型的图标，并显示大小和上传时间。`.exe`、`.dll`、`.scr`、`.cpl`、`.ocx` 会从文件资源中提取内嵌图标，`.ico` 直接显示；没有内嵌图标时自动回退为类型图标
 4. 点击文件名即可下载；每行右侧的「复制」「分享」按钮可以快速分享对应文件
 5. 勾选多个文件（或点击表头全选框），然后点击「⬇️ 打包下载选中」，即可将选中的文件打包成一个 ZIP 下载
 
@@ -237,7 +237,7 @@ curl -C - -O http://localhost:8080/f/example.zip
 
 ## 接口一览
 
-> 下表中的 `/`、`/upload`、`/files`、`/zip` 是默认路径。设置 `FILEHUB_SECRET_PATH` 后，它们会整体移动到 `/<隐藏路径>`、`/<隐藏路径>/upload` 等；`/f/{name}` 下载路径始终不变。
+> 下表中的 `/`、`/upload`、`/files`、`/zip`、`/icon` 是默认路径。设置 `FILEHUB_SECRET_PATH` 后，它们会整体移动到 `/<隐藏路径>`、`/<隐藏路径>/upload` 等；`/f/{name}` 下载路径始终不变。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -246,6 +246,7 @@ curl -C - -O http://localhost:8080/f/example.zip
 | `GET` | `/f/{name}` | 下载文件，支持 `Range` |
 | `GET` | `/files` | 文件列表页，需 HTTP Basic Auth（密码为 `FILEHUB_PASSWORD`） |
 | `POST` | `/zip` | 将多个文件打包为 ZIP，表单字段 `files`（可重复） |
+| `GET` | `/icon/{name}` | 文件内嵌图标（exe/dll/ico），需与文件列表相同的口令 |
 
 上传响应（`Accept: application/json`）：
 
@@ -316,6 +317,7 @@ GitHub Actions 工作流 [`.github/workflows/docker.yml`](.github/workflows/dock
 - 🔐 `/files` 文件列表使用 HTTP Basic Auth 保护；密码随请求明文传输，公网使用请务必配置 HTTPS。
 - 🛡️ 下载使用强制附件（`Content-Disposition: attachment`）并加上 `X-Content-Type-Options: nosniff`、`Content-Security-Policy: sandbox`，降低上传的 HTML/JS 被浏览器直接渲染导致的 XSS 风险。
 - 🛡️ 路径穿越、空文件名、目录已被校验；表单大小和 ZIP 列表数量有限制。
+- 🛡️ 内嵌图标解析只读取 PE 资源段，单个图标限制 1 MiB，损坏或伪造的程序文件会回退为类型图标。
 - ⚠️ 没有删除或过期清理功能，请自行管理磁盘空间。
 - ⚠️ 没有上传频率、总存储配额限制，也不做病毒扫描。公网部署建议在反向代理/WAF 层限流、限制请求体与总容量，并谨慎接收未知文件。
 - 🐳 容器当前以 root 用户运行；如需进一步加固，可自行创建非 root 用户并确保数据卷可写。
