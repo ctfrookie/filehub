@@ -4,7 +4,7 @@
 
 ## 功能特性
 
-- 🖱️ 拖拽或点击上传，带实时进度条
+- 🖱️ 拖拽或点击上传，带实时进度、上传速度和用时显示
 - 🔗 保留原始文件名，同名文件自动追加时间戳
 - 🖼️ 文件列表按文件类型显示图标
 - ☑️ 支持多选文件，一键打包为 ZIP 下载
@@ -140,7 +140,8 @@ docker pull ghcr.io/ctfrookie/filehub:latest
 
 1. 打开 `http://<服务器地址>:8080`
 2. 将文件拖入虚线框，或点击「选择文件」
-3. 上传完成后会显示形如 `/f/example.zip` 的链接，以及「复制链接」按钮；支持系统分享的设备还会显示「分享」按钮，可一键发送到微信、邮件等应用
+3. 上传过程中会显示百分比、已上传大小、总大小和平均速度；完成后显示总用时和平均速度
+4. 上传完成后会显示形如 `/f/example.zip` 的链接，以及「复制链接」按钮；支持系统分享的设备还会显示「分享」按钮，可一键发送到微信、邮件等应用
 
 > 文件会保留原始名称。如果同名文件已存在，会自动在扩展名前追加时间戳，例如 `example_20261102-103045.zip`，不会覆盖旧文件。
 
@@ -176,6 +177,8 @@ curl -F "file=@./example.zip" -H "Accept: application/json" \
 > 请求头带 `Accept: application/json` 时返回 JSON；否则返回一个简单的 HTML 成功页。
 
 ### 下载
+
+文件会以附件形式下载（`Content-Disposition: attachment`），同时保留原始文件名：
 
 ```bash
 curl -O -J http://localhost:8080/f/example.zip
@@ -263,8 +266,13 @@ GitHub Actions 工作流 [`.github/workflows/docker.yml`](.github/workflows/dock
 
 - ⚠️ 上传接口、`/zip` 打包接口和 `/f/` 下载链接**没有鉴权**，任何能访问端口的人都可以上传，拿到链接即可下载。公网部署请务必配合反向代理、访问控制或内网使用。
 - 🔐 `/files` 文件列表使用 HTTP Basic Auth 保护；密码随请求明文传输，公网使用请务必配置 HTTPS。
+- 🛡️ 下载使用强制附件（`Content-Disposition: attachment`）并加上 `X-Content-Type-Options: nosniff`、`Content-Security-Policy: sandbox`，降低上传的 HTML/JS 被浏览器直接渲染导致的 XSS 风险。
+- 🛡️ 路径穿越、空文件名、目录已被校验；表单大小和 ZIP 列表数量有限制。
 - ⚠️ 没有删除或过期清理功能，请自行管理磁盘空间。
+- ⚠️ 没有上传频率、总存储配额限制，也不做病毒扫描。公网部署建议在反向代理/WAF 层限流、限制请求体与总容量，并谨慎接收未知文件。
+- 🐳 容器当前以 root 用户运行；如需进一步加固，可自行创建非 root 用户并确保数据卷可写。
 - ⚠️ 文件现在保留原始名称，下载链接是可预测的（例如 `/f/报告.pdf`），拿到文件名即可尝试下载。请勿将敏感文件直接暴露在公网。
+- 🐳 Dockerfile 改用 `golang:1-alpine` 和 `alpine:3` 滚动标签以获取安全补丁，建议定期 `docker pull` 更新镜像。
 - 公网使用建议通过 Nginx/Caddy 配置 HTTPS，并同步放宽上传体积限制，例如 Nginx：
 
   ```nginx

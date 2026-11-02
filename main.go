@@ -8,6 +8,7 @@ import (
 	"html"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,8 +38,14 @@ func main() {
 	http.HandleFunc("/zip", zipHandler)
 
 	addr := ":8080"
+	server := &http.Server{
+		Addr:              addr,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	log.Printf("FileHub listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	log.Fatal(server.ListenAndServe())
 }
 
 // 首页：极简上传页面
@@ -48,6 +55,8 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
 	fmt.Fprint(w, indexHTML)
 }
 
@@ -116,13 +125,27 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		http.NotFound(w, r)
 		return
 	}
-	// 使用 ServeFile 支持 Range / 断点续传
-	http.ServeFile(w, r, path)
+
+	// 强制下载，避免上传的 HTML/SVG 等在同源下执行脚本
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if disposition := mime.FormatMediaType("attachment", map[string]string{"filename": name}); disposition != "" {
+		w.Header().Set("Content-Disposition", disposition)
+	}
+	// 使用 ServeContent 支持 Range / 断点续传
+	http.ServeContent(w, r, name, info.ModTime(), f)
 }
 
 // 多选下载：将选中的文件打包为 ZIP
@@ -175,6 +198,7 @@ func zipHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Disposition",
 		fmt.Sprintf(`attachment; filename="filehub-%s.zip"`, time.Now().Format("20060102-150405")))
 	zw := zip.NewWriter(w)
@@ -298,6 +322,10 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "需要口令", http.StatusUnauthorized)
 		return
 	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
 
 	entries, err := os.ReadDir(uploadDir)
 	if err != nil {
@@ -510,6 +538,7 @@ const indexHTML = `<!DOCTYPE html>
   #result a{color:#4a90e2}
   .progress{margin-top:1em;height:6px;background:#eee;border-radius:3px;overflow:hidden;display:none}
   .progress>div{height:100%;width:0;background:#4a90e2;transition:width .2s}
+  .status{margin-top:.6em;color:#666;font-size:.9em;min-height:1.2em}
 </style>
 </head>
 <body>
@@ -521,10 +550,12 @@ const indexHTML = `<!DOCTYPE html>
   <input type="file" id="f">
 </div>
 <div class="progress" id="p"><div id="pb"></div></div>
+<div class="status" id="status" aria-live="polite"></div>
 <div id="result"></div>
 <script>
 const box=document.getElementById('box'),f=document.getElementById('f'),
-      p=document.getElementById('p'),pb=document.getElementById('pb'),res=document.getElementById('result');
+      p=document.getElementById('p'),pb=document.getElementById('pb'),res=document.getElementById('result'),
+      status=document.getElementById('status');
 ['dragover','dragenter'].forEach(e=>box.addEventListener(e,ev=>{ev.preventDefault();box.classList.add('drag')}));
 ['dragleave','drop'].forEach(e=>box.addEventListener(e,ev=>{ev.preventDefault();box.classList.remove('drag')}));
 box.addEventListener('drop',ev=>{if(ev.dataTransfer.files.length)upload(ev.dataTransfer.files[0])});
@@ -581,22 +612,51 @@ function legacyCopy(text){
   });
 }
 
+function formatBytes(n){
+  if(!isFinite(n)||n<0)n=0;
+  if(n<1024)return Math.round(n)+' B';
+  const units=['KB','MB','GB','TB'];
+  let i=-1;
+  do{n/=1024;i++}while(n>=1024&&i<units.length-1);
+  return n.toFixed(n>=100?0:n>=10?1:2)+' '+units[i];
+}
+function formatSpeed(bytesPerSec){
+  if(!isFinite(bytesPerSec)||bytesPerSec<=0)return '0 B/s';
+  return formatBytes(bytesPerSec)+'/s';
+}
+function now(){
+  return window.performance&&performance.now?performance.now():Date.now();
+}
+
 function upload(file){
   const fd=new FormData();
   fd.append('file',file);
   const xhr=new XMLHttpRequest();
   xhr.open('POST','/upload');
   xhr.setRequestHeader('Accept','application/json');
-  p.style.display='block';res.innerHTML='';
-  xhr.upload.onprogress=e=>{if(e.lengthComputable)pb.style.width=(e.loaded/e.total*100)+'%'};
+  const started=now();
+  p.style.display='block';pb.style.width='0';res.textContent='';
+  status.textContent='准备上传…';
+  xhr.upload.onprogress=e=>{
+    if(!e.lengthComputable||e.total<=0)return;
+    const pct=Math.min(100,e.loaded/e.total*100);
+    const secs=Math.max((now()-started)/1000,0.2);
+    pb.style.width=pct+'%';
+    status.textContent=pct.toFixed(1)+'% · '+formatBytes(e.loaded)+' / '+formatBytes(e.total)+' · 平均 '+formatSpeed(e.loaded/secs);
+  };
   xhr.onload=()=>{
     p.style.display='none';pb.style.width='0';
+    const secs=Math.max((now()-started)/1000,0.001);
     if(xhr.status===200){
       const r=JSON.parse(xhr.responseText);
+      status.textContent='完成 · 用时 '+secs.toFixed(secs<10?1:0)+' 秒 · 平均 '+formatSpeed(file.size/secs);
       showResult(r);
-    }else{res.textContent='❌ 上传失败：'+xhr.responseText}
+    }else{
+      status.textContent='';
+      res.textContent='❌ 上传失败：'+xhr.responseText;
+    }
   };
-  xhr.onerror=()=>{p.style.display='none';res.textContent='❌ 网络错误'};
+  xhr.onerror=()=>{p.style.display='none';status.textContent='网络错误';res.textContent='❌ 网络错误'};
   xhr.send(fd);
 }
 </script>
