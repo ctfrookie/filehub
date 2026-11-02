@@ -6,6 +6,7 @@
 
 - 🖱️ 拖拽或点击上传，带实时进度条
 - 🔗 上传后生成随机文件名链接（`/f/<随机串><原扩展名>`）
+- 🔒 可选口令保护的文件列表页，集中查看并下载所有文件
 - 📦 单文件最大 1 GiB
 - ⏯️ 下载支持 `Range` / 断点续传
 - 🐳 提供 Docker / Docker Compose 部署，多架构镜像（amd64 / arm64）
@@ -17,6 +18,8 @@
 .
 ├── main.go                  # 全部服务端逻辑与内置上传页面
 ├── go.mod                   # Go 模块定义（Go 1.22+）
+├── README.md                # 使用文档
+├── .env.example             # 环境变量示例
 ├── Dockerfile               # 多阶段构建
 ├── docker-compose.yml       # 一键部署
 └── .github/workflows/docker.yml  # 构建并推送 GHCR 镜像、生成 SBOM
@@ -29,10 +32,15 @@
 ```bash
 git clone https://github.com/ctfrookie/filehub.git
 cd filehub
+
+# 设置文件列表口令（不设置则 /files 页面关闭）
+cp .env.example .env    # Windows: copy .env.example .env
+# 编辑 .env，把 FILEHUB_PASSWORD 改成自己的口令
+
 docker compose up -d
 ```
 
-访问 <http://localhost:8080>，上传的文件保存在宿主机的 `./data` 目录。
+访问 <http://localhost:8080>，上传的文件保存在宿主机的 `./data` 目录；访问 <http://localhost:8080/files> 并输入口令即可查看所有已上传文件。
 
 ### 方式二：直接拉取镜像
 
@@ -41,6 +49,7 @@ docker run -d \
   --name filehub \
   -p 8080:8080 \
   -v filehub-data:/app/data \
+  -e FILEHUB_PASSWORD=change-me \
   --restart unless-stopped \
   ghcr.io/ctfrookie/filehub:latest
 ```
@@ -50,7 +59,12 @@ docker run -d \
 需要 Go 1.22 或更高版本：
 
 ```bash
-go run .
+# macOS / Linux
+FILEHUB_PASSWORD=change-me go run .
+
+# Windows PowerShell
+$env:FILEHUB_PASSWORD="change-me"; go run .
+
 # 或编译后运行
 go build -o filehub . && ./filehub
 ```
@@ -64,6 +78,20 @@ go build -o filehub . && ./filehub
 1. 打开 `http://<服务器地址>:8080`
 2. 将文件拖入虚线框，或点击「选择文件」
 3. 上传完成后会显示形如 `/f/1a2b3c4d5e6f7a8b.zip` 的链接，复制即可分享
+
+### 查看并下载已上传文件（文件列表）
+
+服务启动时设置环境变量 `FILEHUB_PASSWORD` 后，即可使用口令保护的文件列表：
+
+1. 打开 <http://localhost:8080/files>（首页也有「📁 文件列表」入口）
+2. 浏览器会弹出登录框：
+   - 用户名：任意填写（例如 `admin`）
+   - 密码：`FILEHUB_PASSWORD` 的值
+3. 验证通过后会按上传时间倒序列出所有文件，显示文件名、大小和上传时间，点击文件名即可下载
+
+> 列表中的文件名是上传时生成的随机名（保留原扩展名），原始文件名不会保存。
+
+未设置 `FILEHUB_PASSWORD` 时，`/files` 会返回 404，列表功能保持关闭，避免文件被公开浏览。通过 `/f/...` 分享出去的链接仍然可以直接下载，不受口令影响。
 
 ### 通过 API 上传
 
@@ -99,6 +127,7 @@ curl -C - -O http://localhost:8080/f/1a2b3c4d5e6f7a8b.zip
 | `GET` | `/` | 上传页面 |
 | `POST` | `/upload` | 上传文件，`multipart/form-data`，字段名 `file` |
 | `GET` | `/f/{name}` | 下载文件，支持 `Range` |
+| `GET` | `/files` | 文件列表页，需 HTTP Basic Auth（密码为 `FILEHUB_PASSWORD`） |
 
 上传响应（`Accept: application/json`）：
 
@@ -115,6 +144,7 @@ curl -C - -O http://localhost:8080/f/1a2b3c4d5e6f7a8b.zip
 | --- | --- | --- |
 | 监听端口 | `8080` | 当前硬编码在 `main.go` 中 |
 | 存储目录 | `./data` | 容器内为 `/app/data`，建议挂载持久化 |
+| `FILEHUB_PASSWORD` | 空 | 文件列表访问口令；为空时 `/files` 关闭并返回 404 |
 | 单文件上限 | `1 GiB` | `main.go` 中 `maxSize` |
 | 表单内存缓冲 | `32 MiB` | 超出部分写入临时文件 |
 
@@ -153,8 +183,9 @@ GitHub Actions 工作流 [`.github/workflows/docker.yml`](.github/workflows/dock
 
 ## 注意事项
 
-- ⚠️ 服务**没有鉴权**，任何能访问端口的人都可以上传和下载。公网部署请务必配合反向代理、访问控制或内网使用。
-- ⚠️ 没有文件列表、删除或过期清理功能，请自行管理磁盘空间。
+- ⚠️ 上传接口和 `/f/` 下载链接**没有鉴权**，任何能访问端口的人都可以上传，拿到链接即可下载。公网部署请务必配合反向代理、访问控制或内网使用。
+- 🔐 `/files` 文件列表使用 HTTP Basic Auth 保护；密码随请求明文传输，公网使用请务必配置 HTTPS。
+- ⚠️ 没有删除或过期清理功能，请自行管理磁盘空间。
 - 链接中的随机串为 8 字节（16 位十六进制），无法通过链接猜测文件，但拿到链接即可下载。
 - 公网使用建议通过 Nginx/Caddy 配置 HTTPS，并同步放宽上传体积限制，例如 Nginx：
 

@@ -2,13 +2,17 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -18,12 +22,16 @@ const (
 	maxSize   = 1 << 30 // 1GB
 )
 
+// 文件列表口令，为空时列表功能关闭
+var listPassword = os.Getenv("FILEHUB_PASSWORD")
+
 func main() {
 	os.MkdirAll(uploadDir, 0755)
 
 	http.HandleFunc("/", indexHandler)
 	http.HandleFunc("/upload", uploadHandler)
 	http.HandleFunc("/f/", downloadHandler)
+	http.HandleFunc("/files", filesHandler)
 
 	addr := ":8080"
 	log.Printf("FileHub listening on %s", addr)
@@ -110,6 +118,104 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
+// 文件列表：需设置 FILEHUB_PASSWORD，通过 HTTP Basic Auth 校验口令
+func filesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if listPassword == "" {
+		http.Error(w, "文件列表未启用：请设置 FILEHUB_PASSWORD 环境变量", http.StatusNotFound)
+		return
+	}
+	_, pass, ok := r.BasicAuth()
+	if !ok || subtle.ConstantTimeCompare([]byte(pass), []byte(listPassword)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Basic realm="FileHub", charset="UTF-8"`)
+		http.Error(w, "需要口令", http.StatusUnauthorized)
+		return
+	}
+
+	entries, err := os.ReadDir(uploadDir)
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+
+	type fileItem struct {
+		name    string
+		size    int64
+		modTime time.Time
+	}
+	files := make([]fileItem, 0, len(entries))
+	var total int64
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		files = append(files, fileItem{entry.Name(), info.Size(), info.ModTime()})
+		total += info.Size()
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.After(files[j].modTime) })
+
+	var b strings.Builder
+	b.WriteString(`<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>文件列表 - FileHub</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:880px;margin:3em auto;padding:0 1em;color:#333}
+  h1{font-weight:600}
+  a{color:#4a90e2}
+  table{width:100%;border-collapse:collapse;margin-top:1em}
+  th,td{text-align:left;padding:.65em .4em;border-bottom:1px solid #eee;font-size:.95em}
+  th{color:#888;font-weight:500}
+  td.size,th.size{white-space:nowrap;text-align:right}
+  .empty{color:#999;padding:2em 0}
+</style>
+</head>
+<body>
+<h1>📁 文件列表</h1>
+`)
+	fmt.Fprintf(&b, `<p>共 %d 个文件，总计 %s ｜ <a href="/">上传文件</a></p>`, len(files), formatSize(total))
+	if len(files) == 0 {
+		b.WriteString(`<p class="empty">还没有上传任何文件。</p>`)
+	} else {
+		b.WriteString(`<table>
+<thead><tr><th>文件名</th><th class="size">大小</th><th>上传时间</th></tr></thead>
+<tbody>`)
+		for _, f := range files {
+			name := html.EscapeString(f.name)
+			href := html.EscapeString("/f/" + url.PathEscape(f.name))
+			fmt.Fprintf(&b, `<tr><td><a href="%s">%s</a></td><td class="size">%s</td><td>%s</td></tr>`,
+				href, name, formatSize(f.size), f.modTime.Format("2006-01-02 15:04:05"))
+		}
+		b.WriteString(`</tbody></table>`)
+	}
+	b.WriteString(`</body></html>`)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.WriteString(w, b.String())
+}
+
+func formatSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
 func randomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -127,6 +233,7 @@ const indexHTML = `<!DOCTYPE html>
 <style>
   body{font-family:system-ui,sans-serif;max-width:640px;margin:4em auto;padding:0 1em;color:#333}
   h1{font-weight:600}
+  a{color:#4a90e2}
   .box{border:2px dashed #ccc;border-radius:12px;padding:2em;text-align:center;transition:.2s}
   .box.drag{border-color:#4a90e2;background:#f0f7ff}
   input[type=file]{display:none}
@@ -140,6 +247,7 @@ const indexHTML = `<!DOCTYPE html>
 </head>
 <body>
 <h1>📦 FileHub</h1>
+<p><a href="/files">📁 文件列表</a></p>
 <div class="box" id="box">
   <p>拖拽文件到这里，或</p>
   <button onclick="document.getElementById('f').click()">选择文件</button>

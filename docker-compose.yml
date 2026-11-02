@@ -6,4 +6,6 @@ services:
       - "8080:8080"
     volumes:
       - ./data:/app/data
+    environment:
+      - FILEHUB_PASSWORD=${FILEHUB_PASSWORD:-}
     restart: unless-stopped
