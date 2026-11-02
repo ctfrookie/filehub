@@ -1,6 +1,11 @@
 data/
 .git/
 .github/
+.workbuddy/
 *.md
 docker-compose.yml
+.gitignore
 .env
+.env.*
+filehub
+filehub.exe

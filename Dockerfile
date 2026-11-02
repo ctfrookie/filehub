@@ -2,8 +2,7 @@
 # 使用滚动的大版本标签，构建时自动获取 Go 最新安全补丁
 FROM golang:1-alpine AS builder
 WORKDIR /app
-COPY go.mod ./
-COPY *.go ./
+COPY . .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o filehub .
 
 # 运行阶段
