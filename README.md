@@ -9,6 +9,7 @@
 - 🖼️ 文件列表按文件类型显示图标
 - ☑️ 支持多选文件，一键打包为 ZIP 下载
 - 🔒 可选口令保护的文件列表页，集中查看并下载所有文件
+- 🙈 可选隐藏上传入口路径，根路径直接返回 404
 - 📤 上传完成或文件列表中一键复制链接，移动端可调用系统分享
 - 📦 单文件最大 1 GiB
 - ⏯️ 下载支持 `Range` / 断点续传
@@ -39,6 +40,7 @@ cd filehub
 # 设置文件列表口令（不设置则 /files 页面关闭）
 cp .env.example .env    # Windows: copy .env.example .env
 # 编辑 .env，把 FILEHUB_PASSWORD 改成自己的口令
+# 可选：设置 FILEHUB_SECRET_PATH 隐藏上传入口，例如 my-secret-path
 
 # 方式 A：从源码构建并启动
 docker compose up -d --build
@@ -77,6 +79,47 @@ go build -o filehub . && ./filehub
 ```
 
 默认监听 `:8080`，文件写入当前目录下的 `./data`。
+
+## 隐藏上传入口（可选）
+
+默认情况下上传页面位于根路径 `/`，很容易被扫描到。设置 `FILEHUB_SECRET_PATH` 后，上传页面、上传接口、文件列表和打包下载都会移动到该路径下，根路径及其它旧路径统一返回 404：
+
+```bash
+# Docker Compose：在 .env 中设置
+FILEHUB_SECRET_PATH=my-secret-path
+
+# docker run
+docker run -d \
+  --name filehub \
+  -p 8080:8080 \
+  -v filehub-data:/app/data \
+  -e FILEHUB_PASSWORD=change-me \
+  -e FILEHUB_SECRET_PATH=my-secret-path \
+  --restart unless-stopped \
+  ghcr.io/ctfrookie/filehub:latest
+
+# 本地运行
+FILEHUB_SECRET_PATH=my-secret-path go run .
+```
+
+配置后的访问地址（以 `my-secret-path` 为例）：
+
+| 功能 | 路径 |
+| --- | --- |
+| 上传页面 | `/my-secret-path` |
+| 上传接口 | `/my-secret-path/upload` |
+| 文件列表 | `/my-secret-path/files` |
+| 打包下载 | `/my-secret-path/zip` |
+| 文件下载 | `/f/{文件名}`（始终公开，保持不变） |
+
+路径规则：
+
+- 6–64 个字符，可带或不带前导 `/`
+- 只能包含字母、数字、`-` 和 `_`
+- 不能使用保留路径 `f`、`upload`、`files`、`zip`
+- 留空或设为 `/` 时保持旧行为，上传页面仍在根路径
+
+> ⚠️ 隐藏路径只是减少被扫描和误访问的概率，**不是身份认证**。知道路径的人仍然可以上传和访问文件列表（列表仍受 `FILEHUB_PASSWORD` 保护）。公网部署请同时配合 HTTPS、访问控制或反向代理。
 
 ## 更新
 
@@ -138,7 +181,7 @@ docker pull ghcr.io/ctfrookie/filehub:latest
 
 ### 网页上传
 
-1. 打开 `http://<服务器地址>:8080`
+1. 打开 `http://<服务器地址>:8080`（设置了 `FILEHUB_SECRET_PATH` 时为 `http://<服务器地址>:8080/<隐藏路径>`）
 2. 将文件拖入虚线框，或点击「选择文件」
 3. 上传过程中会显示百分比、已上传大小、总大小和平均速度；完成后显示总用时和平均速度
 4. 上传完成后会显示形如 `/f/example.zip` 的链接，以及「复制链接」按钮；支持系统分享的设备还会显示「分享」按钮，可一键发送到微信、邮件等应用
@@ -149,7 +192,7 @@ docker pull ghcr.io/ctfrookie/filehub:latest
 
 服务启动时设置环境变量 `FILEHUB_PASSWORD` 后，即可使用口令保护的文件列表：
 
-1. 打开 <http://localhost:8080/files>（首页也有「📁 文件列表」入口）
+1. 打开 <http://localhost:8080/files>（首页也有「📁 文件列表」入口；设置了隐藏路径时改为 `/<隐藏路径>/files`）
 2. 浏览器会弹出登录框：
    - 用户名：任意填写（例如 `admin`）
    - 密码：`FILEHUB_PASSWORD` 的值
@@ -167,6 +210,8 @@ docker pull ghcr.io/ctfrookie/filehub:latest
 curl -F "file=@./example.zip" -H "Accept: application/json" \
   http://localhost:8080/upload
 ```
+
+> 设置了 `FILEHUB_SECRET_PATH` 时，上传地址变为 `/<隐藏路径>/upload`。
 
 返回：
 
@@ -191,6 +236,8 @@ curl -C - -O http://localhost:8080/f/example.zip
 ```
 
 ## 接口一览
+
+> 下表中的 `/`、`/upload`、`/files`、`/zip` 是默认路径。设置 `FILEHUB_SECRET_PATH` 后，它们会整体移动到 `/<隐藏路径>`、`/<隐藏路径>/upload` 等；`/f/{name}` 下载路径始终不变。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -226,6 +273,7 @@ curl -X POST \
 | 监听端口 | `8080` | 当前硬编码在 `main.go` 中 |
 | 存储目录 | `./data` | 容器内为 `/app/data`，建议挂载持久化 |
 | `FILEHUB_PASSWORD` | 空 | 文件列表访问口令；为空时 `/files` 关闭并返回 404 |
+| `FILEHUB_SECRET_PATH` | 空 | 上传入口隐藏路径；为空时使用根路径。设置后 `/`、`/upload`、`/files`、`/zip` 全部返回 404 |
 | 单文件上限 | `1 GiB` | `main.go` 中 `maxSize` |
 | 表单内存缓冲 | `32 MiB` | 超出部分写入临时文件 |
 
@@ -271,6 +319,7 @@ GitHub Actions 工作流 [`.github/workflows/docker.yml`](.github/workflows/dock
 - ⚠️ 没有删除或过期清理功能，请自行管理磁盘空间。
 - ⚠️ 没有上传频率、总存储配额限制，也不做病毒扫描。公网部署建议在反向代理/WAF 层限流、限制请求体与总容量，并谨慎接收未知文件。
 - 🐳 容器当前以 root 用户运行；如需进一步加固，可自行创建非 root 用户并确保数据卷可写。
+- ⚠️ 隐藏路径（`FILEHUB_SECRET_PATH`）只是减少入口被扫描的概率，**不等于鉴权**：知道路径的人仍可上传，`/f/` 下载链接公开，文件列表仍依赖 `FILEHUB_PASSWORD` 保护。
 - ⚠️ 文件现在保留原始名称，下载链接是可预测的（例如 `/f/报告.pdf`），拿到文件名即可尝试下载。请勿将敏感文件直接暴露在公网。
 - 🐳 Dockerfile 改用 `golang:1-alpine` 和 `alpine:3` 滚动标签以获取安全补丁，建议定期 `docker pull` 更新镜像。
 - 公网使用建议通过 Nginx/Caddy 配置 HTTPS，并同步放宽上传体积限制，例如 Nginx：

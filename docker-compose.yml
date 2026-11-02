@@ -9,4 +9,5 @@ services:
       - ./data:/app/data
     environment:
       - FILEHUB_PASSWORD=${FILEHUB_PASSWORD:-}
+      - FILEHUB_SECRET_PATH=${FILEHUB_SECRET_PATH:-}
     restart: unless-stopped

@@ -28,14 +28,31 @@ const (
 // 文件列表口令，为空时列表功能关闭
 var listPassword = os.Getenv("FILEHUB_PASSWORD")
 
+// 上传页面隐藏路径，由 FILEHUB_SECRET_PATH 配置；为空时使用根路径
+var secretPath string
+
 func main() {
 	os.MkdirAll(uploadDir, 0755)
 
-	http.HandleFunc("/", indexHandler)
-	http.HandleFunc("/upload", uploadHandler)
+	secretPath = normalizeSecretPath(os.Getenv("FILEHUB_SECRET_PATH"))
+	if secretPath == "" {
+		http.HandleFunc("/", indexHandler)
+		http.HandleFunc("/upload", uploadHandler)
+		http.HandleFunc("/files", filesHandler)
+		http.HandleFunc("/zip", zipHandler)
+	} else {
+		http.HandleFunc(secretPath, indexHandler)
+		http.HandleFunc(secretPath+"/", indexHandler)
+		http.HandleFunc(secretPath+"/upload", uploadHandler)
+		http.HandleFunc(secretPath+"/files", filesHandler)
+		http.HandleFunc(secretPath+"/zip", zipHandler)
+		// 根路径及其它未匹配路径统一返回 404，隐藏上传入口
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		})
+		log.Printf("Upload page hidden at configured secret path")
+	}
 	http.HandleFunc("/f/", downloadHandler)
-	http.HandleFunc("/files", filesHandler)
-	http.HandleFunc("/zip", zipHandler)
 
 	addr := ":8080"
 	server := &http.Server{
@@ -48,16 +65,57 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
+// 校验并规范化隐藏路径，必须是单个路径段，避免与内部路由冲突
+func normalizeSecretPath(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "/" {
+		return ""
+	}
+	if !strings.HasPrefix(raw, "/") {
+		raw = "/" + raw
+	}
+	raw = strings.TrimRight(raw, "/")
+	if raw == "" {
+		return ""
+	}
+	if len(raw) < 7 || len(raw) > 65 {
+		log.Fatalf("FILEHUB_SECRET_PATH must be 6-64 characters after '/', e.g. /my-secret-path")
+	}
+	for _, r := range raw[1:] {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+			log.Fatalf("FILEHUB_SECRET_PATH may only contain letters, digits, '-' and '_'")
+		}
+	}
+	switch raw {
+	case "/f", "/upload", "/files", "/zip":
+		log.Fatalf("FILEHUB_SECRET_PATH conflicts with a reserved route: %s", raw)
+	}
+	return raw
+}
+
 // 首页：极简上传页面
 func indexHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if secretPath == "" {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+	} else if r.URL.Path != secretPath && r.URL.Path != secretPath+"/" {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
-	fmt.Fprint(w, indexHTML)
+	fmt.Fprint(w, strings.ReplaceAll(indexHTML, "__BASE__", secretPath))
+}
+
+// 上传入口首页：隐藏路径为空时返回根路径
+func homePath() string {
+	if secretPath == "" {
+		return "/"
+	}
+	return secretPath
 }
 
 // 上传处理
@@ -114,7 +172,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `<html><body style="font-family:sans-serif;padding:2em">
 <h3>上传成功</h3>
 <p><a href="%s">%s</a></p>
-<p><a href="/">返回</a></p></body></html>`, html.EscapeString(fileURL), html.EscapeString(storedName))
+<p><a href="%s">返回</a></p></body></html>`,
+		html.EscapeString(fileURL), html.EscapeString(storedName), html.EscapeString(homePath()))
 }
 
 // 下载处理
@@ -386,14 +445,14 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 <body>
 <h1>📁 文件列表</h1>
 `)
-	fmt.Fprintf(&b, `<p>共 %d 个文件，总计 %s ｜ <a href="/">上传文件</a></p>`, len(files), formatSize(total))
+	fmt.Fprintf(&b, `<p>共 %d 个文件，总计 %s ｜ <a href="%s">上传文件</a></p>`, len(files), formatSize(total), html.EscapeString(homePath()))
 	if len(files) == 0 {
 		b.WriteString(`<p class="empty">还没有上传任何文件。</p>`)
 	} else {
-		b.WriteString(`<form method="post" action="/zip">
+		fmt.Fprintf(&b, `<form method="post" action="%s">
 <table>
 <thead><tr><th class="check"><input type="checkbox" id="checkAll" aria-label="全选"></th><th>文件名</th><th class="size">大小</th><th>上传时间</th><th class="ops">操作</th></tr></thead>
-<tbody>`)
+<tbody>`, html.EscapeString(secretPath+"/zip"))
 		for _, f := range files {
 			name := html.EscapeString(f.name)
 			href := html.EscapeString("/f/" + url.PathEscape(f.name))
@@ -543,7 +602,7 @@ const indexHTML = `<!DOCTYPE html>
 </head>
 <body>
 <h1>📦 FileHub</h1>
-<p><a href="/files">📁 文件列表</a></p>
+<p><a href="__BASE__/files">📁 文件列表</a></p>
 <div class="box" id="box">
   <p>拖拽文件到这里，或</p>
   <button onclick="document.getElementById('f').click()">选择文件</button>
@@ -632,7 +691,7 @@ function upload(file){
   const fd=new FormData();
   fd.append('file',file);
   const xhr=new XMLHttpRequest();
-  xhr.open('POST','/upload');
+  xhr.open('POST','__BASE__/upload');
   xhr.setRequestHeader('Accept','application/json');
   const started=now();
   p.style.display='block';pb.style.width='0';res.textContent='';
