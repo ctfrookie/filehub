@@ -3,3 +3,4 @@ data/
 .github/
 *.md
 docker-compose.yml
+.env

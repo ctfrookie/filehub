@@ -1,9 +1,9 @@
 package main
 
 import (
-	"crypto/rand"
+	"archive/zip"
 	"crypto/subtle"
-	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io"
@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -32,6 +34,7 @@ func main() {
 	http.HandleFunc("/upload", uploadHandler)
 	http.HandleFunc("/f/", downloadHandler)
 	http.HandleFunc("/files", filesHandler)
+	http.HandleFunc("/zip", zipHandler)
 
 	addr := ":8080"
 	log.Printf("FileHub listening on %s", addr)
@@ -69,53 +72,214 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// 生成安全文件名：随机串 + 原扩展名
-	ext := filepath.Ext(header.Filename)
-	randName := randomHex(8) + ext
-	dstPath := filepath.Join(uploadDir, randName)
-
-	dst, err := os.Create(dstPath)
+	// 保留原始文件名；重名时自动追加时间戳
+	originalName := header.Filename
+	safeName := sanitizeFilename(originalName)
+	dst, storedName, err := createUniqueFile(uploadDir, safeName)
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
-	defer dst.Close()
+	dstPath := filepath.Join(uploadDir, storedName)
 
 	if _, err := io.Copy(dst, file); err != nil {
+		dst.Close()
+		os.Remove(dstPath)
+		http.Error(w, "save failed", http.StatusInternalServerError)
+		return
+	}
+	if err := dst.Close(); err != nil {
 		os.Remove(dstPath)
 		http.Error(w, "save failed", http.StatusInternalServerError)
 		return
 	}
 
-	url := "/f/" + randName
+	fileURL := "/f/" + url.PathEscape(storedName)
 	// 如果是 API 调用返回 JSON，否则返回 HTML
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"url":%q,"name":%q}`, url, header.Filename)
+		json.NewEncoder(w).Encode(map[string]string{"url": fileURL, "name": originalName})
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<html><body style="font-family:sans-serif;padding:2em">
 <h3>上传成功</h3>
 <p><a href="%s">%s</a></p>
-<p><a href="/">返回</a></p></body></html>`, url, url)
+<p><a href="/">返回</a></p></body></html>`, html.EscapeString(fileURL), html.EscapeString(storedName))
 }
 
 // 下载处理
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/f/")
-	// 防路径穿越
-	if name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
+	path, ok := storedFilePath(name)
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	path := filepath.Join(uploadDir, name)
-	if _, err := os.Stat(path); err != nil {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
 		http.NotFound(w, r)
 		return
 	}
 	// 使用 ServeFile 支持 Range / 断点续传
 	http.ServeFile(w, r, path)
+}
+
+// 多选下载：将选中的文件打包为 ZIP
+func zipHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	names := r.Form["files"]
+	if len(names) == 0 {
+		http.Error(w, "未选择文件", http.StatusBadRequest)
+		return
+	}
+	if len(names) > 500 {
+		http.Error(w, "一次最多选择 500 个文件", http.StatusBadRequest)
+		return
+	}
+
+	type zipItem struct {
+		name string
+		path string
+		info os.FileInfo
+	}
+	items := make([]zipItem, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		path, ok := storedFilePath(name)
+		if !ok {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		items = append(items, zipItem{name, path, info})
+		seen[name] = true
+	}
+	if len(items) == 0 {
+		http.Error(w, "没有可下载的文件", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf(`attachment; filename="filehub-%s.zip"`, time.Now().Format("20060102-150405")))
+	zw := zip.NewWriter(w)
+	for _, item := range items {
+		header, err := zip.FileInfoHeader(item.info)
+		if err != nil {
+			log.Printf("zip header %s: %v", item.name, err)
+			continue
+		}
+		header.Name = item.name
+		header.Method = zip.Store
+		entry, err := zw.CreateHeader(header)
+		if err != nil {
+			log.Printf("zip create %s: %v", item.name, err)
+			break
+		}
+		src, err := os.Open(item.path)
+		if err != nil {
+			log.Printf("zip open %s: %v", item.name, err)
+			continue
+		}
+		_, err = io.Copy(entry, src)
+		src.Close()
+		if err != nil {
+			log.Printf("zip copy %s: %v", item.name, err)
+			break
+		}
+	}
+	if err := zw.Close(); err != nil {
+		log.Printf("zip close: %v", err)
+	}
+}
+
+// 校验并返回数据目录下的文件路径，拒绝路径穿越
+func storedFilePath(name string) (string, bool) {
+	if name == "" || name == "." || name == ".." ||
+		strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+		return "", false
+	}
+	return filepath.Join(uploadDir, name), true
+}
+
+// 清洗上传文件名，只去掉路径分隔符与控制字符，尽量保留原始名称
+func sanitizeFilename(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = filepath.Base(name)
+	name = strings.Map(func(r rune) rune {
+		if r == 0 || unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return "file"
+	}
+
+	const maxNameBytes = 200
+	if len(name) > maxNameBytes {
+		ext := filepath.Ext(name)
+		if len(ext) > 40 {
+			ext = truncateUTF8(ext, 40)
+		}
+		base := truncateUTF8(strings.TrimSuffix(name, filepath.Ext(name)), maxNameBytes-len(ext))
+		base = strings.TrimSpace(base)
+		if base == "" {
+			base = "file"
+		}
+		name = base + ext
+	}
+	return name
+}
+
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
+
+// 创建文件；若同名已存在，则在扩展名前追加时间戳，仍然冲突则追加序号
+func createUniqueFile(dir, name string) (*os.File, string, error) {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	stamp := time.Now().Format("20060102-150405")
+
+	for i := 0; ; i++ {
+		candidate := name
+		if i == 1 {
+			candidate = base + "_" + stamp + ext
+		} else if i > 1 {
+			candidate = fmt.Sprintf("%s_%s_%d%s", base, stamp, i-1, ext)
+		}
+
+		f, err := os.OpenFile(filepath.Join(dir, candidate), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err == nil {
+			return f, candidate, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", err
+		}
+	}
 }
 
 // 文件列表：需设置 FILEHUB_PASSWORD，通过 HTTP Basic Auth 校验口令
@@ -180,6 +344,14 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
   td.ops button{background:#fff;color:#4a90e2;border:1px solid #4a90e2;border-radius:6px;padding:.3em .7em;margin-left:.35em;cursor:pointer;font-size:.85em}
   td.ops button:hover{background:#f0f7ff}
   td.ops button.copied{background:#4a90e2;color:#fff}
+  .check{width:2.2em;text-align:center}
+  .check input{width:1.05em;height:1.05em;cursor:pointer;accent-color:#4a90e2}
+  .icon{display:inline-block;width:1.6em;text-align:center}
+  .bulk{display:flex;align-items:center;gap:.8em;margin-top:1.2em;flex-wrap:wrap}
+  .bulk button{background:#4a90e2;color:#fff;border:none;border-radius:8px;padding:.65em 1.3em;cursor:pointer;font-size:.95em}
+  .bulk button:hover{background:#357abd}
+  .bulk button:disabled{background:#c9d6e6;cursor:not-allowed}
+  #selCount{color:#888;font-size:.9em}
   .empty{color:#999;padding:2em 0}
 </style>
 </head>
@@ -190,16 +362,22 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 	if len(files) == 0 {
 		b.WriteString(`<p class="empty">还没有上传任何文件。</p>`)
 	} else {
-		b.WriteString(`<table>
-<thead><tr><th>文件名</th><th class="size">大小</th><th>上传时间</th><th class="ops">操作</th></tr></thead>
+		b.WriteString(`<form method="post" action="/zip">
+<table>
+<thead><tr><th class="check"><input type="checkbox" id="checkAll" aria-label="全选"></th><th>文件名</th><th class="size">大小</th><th>上传时间</th><th class="ops">操作</th></tr></thead>
 <tbody>`)
 		for _, f := range files {
 			name := html.EscapeString(f.name)
 			href := html.EscapeString("/f/" + url.PathEscape(f.name))
-			fmt.Fprintf(&b, `<tr><td><a href="%s">%s</a></td><td class="size">%s</td><td>%s</td><td class="ops"><button type="button" data-copy="%s">复制</button><button type="button" data-share="%s">分享</button></td></tr>`,
-				href, name, formatSize(f.size), f.modTime.Format("2006-01-02 15:04:05"), href, href)
+			fmt.Fprintf(&b, `<tr><td class="check"><input type="checkbox" class="file-check" name="files" value="%s" aria-label="选择 %s"></td><td><span class="icon">%s</span><a href="%s">%s</a></td><td class="size">%s</td><td>%s</td><td class="ops"><button type="button" data-copy="%s">复制</button><button type="button" data-share="%s">分享</button></td></tr>`,
+				name, name, fileIcon(f.name), href, name, formatSize(f.size), f.modTime.Format("2006-01-02 15:04:05"), href, href)
 		}
-		b.WriteString(`</tbody></table>`)
+		b.WriteString(`</tbody></table>
+<div class="bulk">
+<button type="submit" id="downloadSelected">⬇️ 打包下载选中</button>
+<span id="selCount">已选 0 个</span>
+</div>
+</form>`)
 	}
 	b.WriteString(`<script>
 function copyText(text){
@@ -219,6 +397,27 @@ function legacyCopy(text){
   });
 }
 function absolute(path){return location.origin+path}
+var checks=Array.prototype.slice.call(document.querySelectorAll('.file-check'));
+var checkAll=document.getElementById('checkAll');
+var selCount=document.getElementById('selCount');
+var dlBtn=document.getElementById('downloadSelected');
+function refreshSelection(){
+  var n=checks.filter(function(c){return c.checked}).length;
+  if(selCount) selCount.textContent='已选 '+n+' 个';
+  if(dlBtn) dlBtn.disabled=n===0;
+  if(checkAll){
+    checkAll.checked=n>0 && n===checks.length;
+    checkAll.indeterminate=n>0 && n<checks.length;
+  }
+}
+if(checkAll){
+  checkAll.addEventListener('change',function(){
+    checks.forEach(function(c){c.checked=checkAll.checked});
+    refreshSelection();
+  });
+}
+checks.forEach(function(c){c.addEventListener('change',refreshSelection)});
+refreshSelection();
 document.querySelectorAll('[data-copy]').forEach(function(btn){
   btn.addEventListener('click',function(){
     copyText(absolute(btn.dataset.copy)).then(function(){
@@ -256,12 +455,37 @@ func formatSize(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-func randomHex(n int) string {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+func fileIcon(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".ico", ".avif", ".heic":
+		return "🖼️"
+	case ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".wmv":
+		return "🎬"
+	case ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus":
+		return "🎵"
+	case ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz":
+		return "🗜️"
+	case ".pdf":
+		return "📕"
+	case ".doc", ".docx", ".rtf":
+		return "📝"
+	case ".xls", ".xlsx", ".csv", ".ods":
+		return "📊"
+	case ".ppt", ".pptx", ".odp":
+		return "📽️"
+	case ".go", ".js", ".ts", ".jsx", ".tsx", ".py", ".java", ".c", ".cpp", ".h",
+		".rs", ".php", ".rb", ".sh", ".ps1", ".html", ".css", ".json", ".yml",
+		".yaml", ".xml", ".toml", ".sql":
+		return "💻"
+	case ".txt", ".md", ".log":
+		return "📄"
+	case ".exe", ".msi", ".apk", ".dmg", ".deb", ".rpm", ".iso":
+		return "⚙️"
+	case ".ttf", ".otf", ".woff", ".woff2":
+		return "🔤"
+	default:
+		return "📎"
 	}
-	return hex.EncodeToString(b)
 }
 
 const indexHTML = `<!DOCTYPE html>
@@ -311,7 +535,7 @@ function showResult(r){
   const p=document.createElement('p');
   p.textContent='✅ 上传成功：';
   const a=document.createElement('a');
-  a.href=r.url;a.textContent=r.url;a.target='_blank';a.rel='noopener';
+  a.href=r.url;a.textContent=decodeURIComponent(r.url);a.target='_blank';a.rel='noopener';
   p.appendChild(a);
   res.appendChild(p);
 

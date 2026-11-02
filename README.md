@@ -1,11 +1,13 @@
 # FileHub
 
-一个极简的自托管文件中转服务：打开网页拖拽文件即可上传，获得随机短链接用于分享；支持大文件与断点续传下载。
+一个极简的自托管文件中转服务：打开网页拖拽文件即可上传，获得可直接分享的文件链接；支持大文件、断点续传、文件列表与多选打包下载。
 
 ## 功能特性
 
 - 🖱️ 拖拽或点击上传，带实时进度条
-- 🔗 上传后生成随机文件名链接（`/f/<随机串><原扩展名>`）
+- 🔗 保留原始文件名，同名文件自动追加时间戳
+- 🖼️ 文件列表按文件类型显示图标
+- ☑️ 支持多选文件，一键打包为 ZIP 下载
 - 🔒 可选口令保护的文件列表页，集中查看并下载所有文件
 - 📤 上传完成或文件列表中一键复制链接，移动端可调用系统分享
 - 📦 单文件最大 1 GiB
@@ -38,7 +40,11 @@ cd filehub
 cp .env.example .env    # Windows: copy .env.example .env
 # 编辑 .env，把 FILEHUB_PASSWORD 改成自己的口令
 
-docker compose up -d
+# 方式 A：从源码构建并启动
+docker compose up -d --build
+
+# 方式 B：使用已发布的 GHCR 镜像
+docker compose pull && docker compose up -d
 ```
 
 访问 <http://localhost:8080>，上传的文件保存在宿主机的 `./data` 目录；访问 <http://localhost:8080/files> 并输入口令即可查看所有已上传文件。
@@ -72,13 +78,42 @@ go build -o filehub . && ./filehub
 
 默认监听 `:8080`，文件写入当前目录下的 `./data`。
 
+## 更新
+
+使用 Docker Compose 部署时，一条命令即可拉取最新镜像并重建容器：
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+如果是从源码构建：
+
+```bash
+git pull && docker compose up -d --build
+```
+
+`docker run` 部署可以停止并删除旧容器后重新运行（数据卷不会丢失）：
+
+```bash
+docker rm -f filehub
+docker run -d \
+  --name filehub \
+  -p 8080:8080 \
+  -v filehub-data:/app/data \
+  -e FILEHUB_PASSWORD=change-me \
+  --restart unless-stopped \
+  ghcr.io/ctfrookie/filehub:latest
+```
+
 ## 使用说明
 
 ### 网页上传
 
 1. 打开 `http://<服务器地址>:8080`
 2. 将文件拖入虚线框，或点击「选择文件」
-3. 上传完成后会显示形如 `/f/1a2b3c4d5e6f7a8b.zip` 的链接，以及「复制链接」按钮；支持系统分享的设备还会显示「分享」按钮，可一键发送到微信、邮件等应用
+3. 上传完成后会显示形如 `/f/example.zip` 的链接，以及「复制链接」按钮；支持系统分享的设备还会显示「分享」按钮，可一键发送到微信、邮件等应用
+
+> 文件会保留原始名称。如果同名文件已存在，会自动在扩展名前追加时间戳，例如 `example_20261102-103045.zip`，不会覆盖旧文件。
 
 ### 查看并下载已上传文件（文件列表）
 
@@ -88,9 +123,11 @@ go build -o filehub . && ./filehub
 2. 浏览器会弹出登录框：
    - 用户名：任意填写（例如 `admin`）
    - 密码：`FILEHUB_PASSWORD` 的值
-3. 验证通过后会按上传时间倒序列出所有文件，显示文件名、大小和上传时间，点击文件名即可下载；每行右侧的「复制」「分享」按钮可以快速分享对应文件
+3. 验证通过后会按上传时间倒序列出所有文件，文件名前会显示对应类型的图标，并显示大小和上传时间
+4. 点击文件名即可下载；每行右侧的「复制」「分享」按钮可以快速分享对应文件
+5. 勾选多个文件（或点击表头全选框），然后点击「⬇️ 打包下载选中」，即可将选中的文件打包成一个 ZIP 下载
 
-> 列表中的文件名是上传时生成的随机名（保留原扩展名），原始文件名不会保存。
+> 文件名保留原始名称；仅在同名冲突时自动追加时间戳，不会覆盖已有文件。
 
 未设置 `FILEHUB_PASSWORD` 时，`/files` 会返回 404，列表功能保持关闭，避免文件被公开浏览。通过 `/f/...` 分享出去的链接仍然可以直接下载，不受口令影响。
 
@@ -104,7 +141,7 @@ curl -F "file=@./example.zip" -H "Accept: application/json" \
 返回：
 
 ```json
-{"url":"/f/1a2b3c4d5e6f7a8b.zip","name":"example.zip"}
+{"url":"/f/example.zip","name":"example.zip"}
 ```
 
 > 请求头带 `Accept: application/json` 时返回 JSON；否则返回一个简单的 HTML 成功页。
@@ -112,13 +149,13 @@ curl -F "file=@./example.zip" -H "Accept: application/json" \
 ### 下载
 
 ```bash
-curl -O -J http://localhost:8080/f/1a2b3c4d5e6f7a8b.zip
+curl -O -J http://localhost:8080/f/example.zip
 ```
 
 支持断点续传：
 
 ```bash
-curl -C - -O http://localhost:8080/f/1a2b3c4d5e6f7a8b.zip
+curl -C - -O http://localhost:8080/f/example.zip
 ```
 
 ## 接口一览
@@ -129,14 +166,25 @@ curl -C - -O http://localhost:8080/f/1a2b3c4d5e6f7a8b.zip
 | `POST` | `/upload` | 上传文件，`multipart/form-data`，字段名 `file` |
 | `GET` | `/f/{name}` | 下载文件，支持 `Range` |
 | `GET` | `/files` | 文件列表页，需 HTTP Basic Auth（密码为 `FILEHUB_PASSWORD`） |
+| `POST` | `/zip` | 将多个文件打包为 ZIP，表单字段 `files`（可重复） |
 
 上传响应（`Accept: application/json`）：
 
 ```json
 {
-  "url": "/f/<随机串><扩展名>",
+  "url": "/f/<文件名>",
   "name": "原始文件名"
 }
+```
+
+打包下载选中文件：
+
+```bash
+curl -X POST \
+  --data-urlencode "files=example.zip" \
+  --data-urlencode "files=另一个文件.txt" \
+  -o files.zip \
+  http://localhost:8080/zip
 ```
 
 ## 配置说明
@@ -153,7 +201,7 @@ curl -C - -O http://localhost:8080/f/1a2b3c4d5e6f7a8b.zip
 
 ## 数据与备份
 
-所有上传文件都存放在数据目录中，文件名会重命名为随机串（保留原扩展名），原始文件名不会保存。备份时直接打包该目录即可：
+所有上传文件都存放在数据目录中，文件名优先使用原始名称；同名时自动追加时间戳（例如 `photo_20261102-103045.jpg`），不会覆盖已有文件。路径分隔符和控制字符会被清理。备份时直接打包该目录即可：
 
 ```bash
 # Docker Compose 部署
@@ -184,10 +232,10 @@ GitHub Actions 工作流 [`.github/workflows/docker.yml`](.github/workflows/dock
 
 ## 注意事项
 
-- ⚠️ 上传接口和 `/f/` 下载链接**没有鉴权**，任何能访问端口的人都可以上传，拿到链接即可下载。公网部署请务必配合反向代理、访问控制或内网使用。
+- ⚠️ 上传接口、`/zip` 打包接口和 `/f/` 下载链接**没有鉴权**，任何能访问端口的人都可以上传，拿到链接即可下载。公网部署请务必配合反向代理、访问控制或内网使用。
 - 🔐 `/files` 文件列表使用 HTTP Basic Auth 保护；密码随请求明文传输，公网使用请务必配置 HTTPS。
 - ⚠️ 没有删除或过期清理功能，请自行管理磁盘空间。
-- 链接中的随机串为 8 字节（16 位十六进制），无法通过链接猜测文件，但拿到链接即可下载。
+- ⚠️ 文件现在保留原始名称，下载链接是可预测的（例如 `/f/报告.pdf`），拿到文件名即可尝试下载。请勿将敏感文件直接暴露在公网。
 - 公网使用建议通过 Nginx/Caddy 配置 HTTPS，并同步放宽上传体积限制，例如 Nginx：
 
   ```nginx
