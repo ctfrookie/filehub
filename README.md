@@ -92,9 +92,10 @@ docker compose pull && docker compose up -d
 git pull && docker compose up -d --build
 ```
 
-`docker run` 部署可以停止并删除旧容器后重新运行（数据卷不会丢失）：
+`docker run` 部署更新时，需要先拉取最新镜像，再重建容器（数据卷不会丢失）：
 
 ```bash
+docker pull ghcr.io/ctfrookie/filehub:latest
 docker rm -f filehub
 docker run -d \
   --name filehub \
@@ -103,6 +104,34 @@ docker run -d \
   -e FILEHUB_PASSWORD=change-me \
   --restart unless-stopped \
   ghcr.io/ctfrookie/filehub:latest
+```
+
+> ⚠️ `docker rm -f filehub` 只删除**容器**，不会删除本地镜像；而 `docker run` 发现本地已有 `latest` 标签时会直接复用，不会自动访问镜像仓库。因此必须先执行 `docker pull`。
+>
+> 也可以让 Docker 每次启动前强制检查更新：
+>
+> ```bash
+> docker rm -f filehub
+> docker run -d --pull always \
+>   --name filehub \
+>   -p 8080:8080 \
+>   -v filehub-data:/app/data \
+>   -e FILEHUB_PASSWORD=change-me \
+>   --restart unless-stopped \
+>   ghcr.io/ctfrookie/filehub:latest
+> ```
+
+如果仍显示旧内容，可以确认镜像是否真的更新：
+
+```bash
+docker image inspect ghcr.io/ctfrookie/filehub:latest --format '{{.Id}} {{.Created}}'
+```
+
+必要时强制删除旧镜像再拉取（不会影响数据卷）：
+
+```bash
+docker rmi ghcr.io/ctfrookie/filehub:latest
+docker pull ghcr.io/ctfrookie/filehub:latest
 ```
 
 ## 使用说明
