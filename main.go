@@ -176,6 +176,10 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
   th,td{text-align:left;padding:.65em .4em;border-bottom:1px solid #eee;font-size:.95em}
   th{color:#888;font-weight:500}
   td.size,th.size{white-space:nowrap;text-align:right}
+  td.ops,th.ops{white-space:nowrap;text-align:right}
+  td.ops button{background:#fff;color:#4a90e2;border:1px solid #4a90e2;border-radius:6px;padding:.3em .7em;margin-left:.35em;cursor:pointer;font-size:.85em}
+  td.ops button:hover{background:#f0f7ff}
+  td.ops button.copied{background:#4a90e2;color:#fff}
   .empty{color:#999;padding:2em 0}
 </style>
 </head>
@@ -187,17 +191,53 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 		b.WriteString(`<p class="empty">还没有上传任何文件。</p>`)
 	} else {
 		b.WriteString(`<table>
-<thead><tr><th>文件名</th><th class="size">大小</th><th>上传时间</th></tr></thead>
+<thead><tr><th>文件名</th><th class="size">大小</th><th>上传时间</th><th class="ops">操作</th></tr></thead>
 <tbody>`)
 		for _, f := range files {
 			name := html.EscapeString(f.name)
 			href := html.EscapeString("/f/" + url.PathEscape(f.name))
-			fmt.Fprintf(&b, `<tr><td><a href="%s">%s</a></td><td class="size">%s</td><td>%s</td></tr>`,
-				href, name, formatSize(f.size), f.modTime.Format("2006-01-02 15:04:05"))
+			fmt.Fprintf(&b, `<tr><td><a href="%s">%s</a></td><td class="size">%s</td><td>%s</td><td class="ops"><button type="button" data-copy="%s">复制</button><button type="button" data-share="%s">分享</button></td></tr>`,
+				href, name, formatSize(f.size), f.modTime.Format("2006-01-02 15:04:05"), href, href)
 		}
 		b.WriteString(`</tbody></table>`)
 	}
-	b.WriteString(`</body></html>`)
+	b.WriteString(`<script>
+function copyText(text){
+  if(navigator.clipboard && window.isSecureContext){
+    return navigator.clipboard.writeText(text).catch(function(){return legacyCopy(text)});
+  }
+  return legacyCopy(text);
+}
+function legacyCopy(text){
+  return new Promise(function(resolve,reject){
+    var ta=document.createElement('textarea');
+    ta.value=text;ta.style.position='fixed';ta.style.top='-9999px';
+    document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy')?resolve():reject(new Error('copy failed'))}
+    catch(e){reject(e)}
+    finally{ta.remove()}
+  });
+}
+function absolute(path){return location.origin+path}
+document.querySelectorAll('[data-copy]').forEach(function(btn){
+  btn.addEventListener('click',function(){
+    copyText(absolute(btn.dataset.copy)).then(function(){
+      btn.textContent='已复制';btn.classList.add('copied');
+      setTimeout(function(){btn.textContent='复制';btn.classList.remove('copied')},1500);
+    }).catch(function(){
+      btn.textContent='复制失败';
+      setTimeout(function(){btn.textContent='复制'},1500);
+    });
+  });
+});
+document.querySelectorAll('[data-share]').forEach(function(btn){
+  if(!navigator.share){btn.remove();return}
+  btn.addEventListener('click',function(){
+    navigator.share({title:'FileHub 文件',url:absolute(btn.dataset.share)}).catch(function(){});
+  });
+});
+</script>
+</body></html>`)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, b.String())
@@ -239,6 +279,9 @@ const indexHTML = `<!DOCTYPE html>
   input[type=file]{display:none}
   button{background:#4a90e2;color:#fff;border:none;padding:.7em 1.6em;border-radius:8px;cursor:pointer;font-size:1em}
   button:hover{background:#357abd}
+  button.secondary{background:#fff;color:#4a90e2;border:1px solid #4a90e2}
+  button.secondary:hover{background:#f0f7ff}
+  .actions{display:flex;gap:.6em;flex-wrap:wrap;align-items:center;margin-top:.8em}
   #result{margin-top:1em;word-break:break-all}
   #result a{color:#4a90e2}
   .progress{margin-top:1em;height:6px;background:#eee;border-radius:3px;overflow:hidden;display:none}
@@ -263,6 +306,57 @@ const box=document.getElementById('box'),f=document.getElementById('f'),
 box.addEventListener('drop',ev=>{if(ev.dataTransfer.files.length)upload(ev.dataTransfer.files[0])});
 f.addEventListener('change',()=>{if(f.files.length)upload(f.files[0])});
 
+function showResult(r){
+  res.textContent='';
+  const p=document.createElement('p');
+  p.textContent='✅ 上传成功：';
+  const a=document.createElement('a');
+  a.href=r.url;a.textContent=r.url;a.target='_blank';a.rel='noopener';
+  p.appendChild(a);
+  res.appendChild(p);
+
+  const actions=document.createElement('div');
+  actions.className='actions';
+  actions.appendChild(makeCopyButton(location.origin+r.url));
+  if(navigator.share){
+    const share=document.createElement('button');
+    share.type='button';share.className='secondary';share.textContent='分享';
+    share.onclick=()=>navigator.share({title:'FileHub 文件',url:location.origin+r.url}).catch(()=>{});
+    actions.appendChild(share);
+  }
+  res.appendChild(actions);
+}
+
+function makeCopyButton(url){
+  const btn=document.createElement('button');
+  btn.type='button';btn.className='secondary';btn.textContent='复制链接';
+  btn.onclick=()=>copyText(url).then(()=>{
+    btn.textContent='已复制 ✓';
+    setTimeout(()=>btn.textContent='复制链接',1500);
+  }).catch(()=>{
+    btn.textContent='复制失败';
+    setTimeout(()=>btn.textContent='复制链接',1500);
+  });
+  return btn;
+}
+
+function copyText(text){
+  if(navigator.clipboard && window.isSecureContext){
+    return navigator.clipboard.writeText(text).catch(()=>legacyCopy(text));
+  }
+  return legacyCopy(text);
+}
+function legacyCopy(text){
+  return new Promise((resolve,reject)=>{
+    const ta=document.createElement('textarea');
+    ta.value=text;ta.style.position='fixed';ta.style.top='-9999px';
+    document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy')?resolve():reject(new Error('copy failed'))}
+    catch(e){reject(e)}
+    finally{ta.remove()}
+  });
+}
+
 function upload(file){
   const fd=new FormData();
   fd.append('file',file);
@@ -275,7 +369,7 @@ function upload(file){
     p.style.display='none';pb.style.width='0';
     if(xhr.status===200){
       const r=JSON.parse(xhr.responseText);
-      res.innerHTML='✅ 上传成功：<a href="'+r.url+'" target="_blank">'+r.url+'</a>';
+      showResult(r);
     }else{res.textContent='❌ 上传失败：'+xhr.responseText}
   };
   xhr.onerror=()=>{p.style.display='none';res.textContent='❌ 网络错误'};
